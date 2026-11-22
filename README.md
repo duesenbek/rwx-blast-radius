@@ -2,20 +2,32 @@
 
 ## Current selector
 
-The optimized entry scores **115.223 simulated seconds with zero misses** on the
-30 supplied samples, down from 152.664 seconds for the previous selector. Three
+The optimized Linux entry scores **94.904 simulated seconds with zero misses** on
+the 30 supplied samples, down from 115.223 seconds for the previous selector. Three
 local Linux/amd64 container runs under the contest limits gave a median score of
-**116.6 seconds including CPU**. This is a sample result, not a hidden-board score.
+**96.9 seconds including all child-process CPU**. This is a sample result, not a hidden-board score.
 Even selecting only the known failing sample tests costs 94.351 simulated seconds.
 
-The image uses `selector.py` and `dependencies.json.gz`, both of which must be
-committed before submitting. The map contains baseline source, line coverage,
-observed class-setting dependencies, fixture reads and operand-type information.
+The image uses `selector.py`, `dependencies.json.gz`, `runtime_probe.py`,
+`prepare_runtime.py` and `baseline.zip`; all must be committed before submitting.
+The map contains baseline source, line coverage, dictionary-value reads,
+class-setting dependencies, fixture reads, operand types and bounded observations
+of primitive comparison operands, collected from the unmodified pinned source.
 It contains no patch IDs, sample answers or precomputed failure sets. Runtime
-selection never reads `answers.json` and requires no network or writable files.
+selection never reads `answers.json` and requires no runtime network. Short dialect
+suites are verified against the actual patch in independent forked processes, in
+a temporary checkout under `/tmp`. Only a fully successful selected suite removes
+its CI workers. Errors, missing dependencies and timeouts keep the static selection.
+Tests retain their original implementations. The image installs pinned `pytz` from
+PyPI and builds hash-validated bytecode before the charged run starts. SQLGlot's
+source license is included in `SQLGLOT_LICENSE` and in the baseline archive.
 Identity/equality normalization is limited to single-file changes with otherwise
 identical syntax and operand types observed on the baseline whose equality is
-identity-based. Other edits use dependency selection; hidden mutations may still
+identity-based. Comparison edits are evaluated against the stored primitive
+operands at runtime; unknown values use the conservative selection. Dictionary
+edits require unchanged keys and otherwise identical syntax. Copying a temporary
+`table_` built from scalar inputs before `alias_` is treated as value-equivalent.
+Other edits use dependency selection; hidden mutations may still
 expose dependencies absent from baseline execution.
 
 Local verification:
@@ -26,6 +38,10 @@ python evaluate.py
 docker build --platform linux/amd64 -t blast-radius-entry .
 python benchmark.py
 ```
+
+`evaluate.py` on Windows verifies the static selection (101.143 simulated seconds).
+`benchmark.py` measures the complete Linux entry, including subprocess CPU, using
+the contest's read-only filesystem, nobody user, 64 MB tmpfs, process and CPU limits.
 
 To regenerate maps, obtain a clean checkout of
 `eb11aec4be8cb2122afe713a4816662c3f0fb2fa` as `sqlglot_repo`, install

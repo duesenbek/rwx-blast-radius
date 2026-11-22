@@ -4,6 +4,9 @@ import ast
 import copy
 import gzip
 import json
+import os
+import operator
+import subprocess
 from pathlib import Path
 import re
 import sys
@@ -14,6 +17,8 @@ with gzip.open(APP_DIR / "dependencies.json.gz", "rt", encoding="utf-8") as hand
     MAP_DATA = json.load(handle)
 LINE_MAP = MAP_DATA["line_map"]
 CONFIG_MAP = MAP_DATA["config_map"]
+MAPPING_READS = MAP_DATA.get("mapping_reads", {})
+COMPARISON_VALUES = MAP_DATA.get("comparison_values", {})
 FILE_MAP = MAP_DATA["file_map"]
 FIXTURE_MAP = MAP_DATA["fixture_map"]
 SOURCES = MAP_DATA["sources"]
@@ -150,6 +155,124 @@ def canonical_tree(tree, filename):
     return ast.dump(NormalizeIdentity().visit(copy.deepcopy(tree)))
 
 
+def comparison_tests(old_tree, new_tree, filename):
+    values = COMPARISON_VALUES.get(filename)
+    if not values:
+        return None
+    restored = copy.deepcopy(new_tree)
+    def index(tree):
+        found = []
+        class Visitor(ast.NodeVisitor):
+            def __init__(self):
+                self.scope = []
+            def visit_scoped(self, node):
+                self.scope.append(node.name)
+                self.generic_visit(node)
+                self.scope.pop()
+            visit_ClassDef = visit_scoped
+            visit_FunctionDef = visit_scoped
+            visit_AsyncFunctionDef = visit_scoped
+            def visit_Compare(self, node):
+                if len(node.ops) == 1:
+                    key = json.dumps([self.scope, ast.dump(node.left), ast.dump(node.comparators[0])],
+                                     separators=(",", ":"))
+                    found.append((key, node))
+                self.generic_visit(node)
+        Visitor().visit(tree)
+        return found
+    before, after = index(old_tree), index(restored)
+    if len(before) != len(after):
+        return None
+    operations = {'Lt': operator.lt, 'LtE': operator.le, 'Gt': operator.gt, 'GtE': operator.ge,
+                  'Eq': operator.eq, 'NotEq': operator.ne}
+    selected = set()
+    handled = False
+    for (old_key, old), (new_key, new) in zip(before, after):
+        a, b = type(old.ops[0]).__name__, type(new.ops[0]).__name__
+        if a == b:
+            continue
+        if old_key != new_key or old_key not in values or a not in operations or b not in operations:
+            return None
+        handled = True
+        for number, pairs in values[old_key].items():
+            if pairs is None:
+                selected.add(int(number))
+                continue
+            try:
+                for left, right in pairs:
+                    x, y = ast.literal_eval(left), ast.literal_eval(right)
+                    if operations[a](x, y) != operations[b](x, y):
+                        selected.add(int(number))
+                        break
+            except (ValueError, TypeError, SyntaxError):
+                selected.add(int(number))
+        new.ops = copy.deepcopy(old.ops)
+    if handled and ast.dump(restored) == ast.dump(old_tree):
+        return selected
+    return None
+
+
+def fresh_copy_tree(tree):
+    """Canonicalize alias_(table_(scalar), copy=...): the table has no owners.
+
+    table_ creates a new Table and fresh identifiers from scalar inputs. alias_
+    copying that temporary cannot affect any caller-owned expression graph.
+    """
+    library_exp = any(isinstance(n, ast.ImportFrom) and n.module == 'sqlglot'
+                      and any(a.name in ('exp', 'expressions') and (a.asname or a.name) == 'exp'
+                              for a in n.names) for n in tree.body)
+    if not library_exp:
+        return ast.dump(tree)
+    functions = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+    class Normalize(ast.NodeTransformer):
+        def __init__(self):
+            self.scalars = set()
+        def visit_FunctionDef(self, node):
+            saved = self.scalars
+            self.scalars = {a.arg for a in node.args.args
+                            if isinstance(a.annotation, ast.Name) and a.annotation.id in ('str', 'int', 'float', 'bool')}
+            parameter_scalars = set(self.scalars)
+            assigned = {}
+            for name in ast.walk(node):
+                if isinstance(name, ast.Name) and isinstance(name.ctx, ast.Store):
+                    assigned[name.id] = assigned.get(name.id, 0) + 1
+            for assignment in ast.walk(node):
+                if isinstance(assignment, ast.Assign):
+                    if len(assignment.targets) == 1 and isinstance(assignment.targets[0], ast.Tuple):
+                        value = assignment.value
+                        definition = functions.get(value.func.id) if isinstance(value, ast.Call) and isinstance(value.func, ast.Name) else None
+                        annotation = definition.returns if definition else None
+                        if isinstance(annotation, ast.Subscript) and isinstance(annotation.value, ast.Name) and annotation.value.id == 'tuple' and isinstance(annotation.slice, ast.Tuple):
+                            for target, item in zip(assignment.targets[0].elts, annotation.slice.elts):
+                                if isinstance(target, ast.Name) and isinstance(item, ast.Name) and item.id in ('str', 'int', 'float', 'bool'):
+                                    self.scalars.add(target.id)
+            self.scalars.difference_update(name for name, count in assigned.items() if count > 1)
+            self.scalars.difference_update(parameter_scalars & assigned.keys())
+            if 'exp' not in assigned and all(a.arg != 'exp' for a in node.args.args):
+                self.generic_visit(node)
+            self.scalars = saved
+            return node
+        def scalar(self, node):
+            return (isinstance(node, ast.Constant) and type(node.value) in (str, int, float, bool, type(None))
+                    or isinstance(node, ast.Name) and node.id in self.scalars)
+        def visit_Call(self, node):
+            self.generic_visit(node)
+            if not (isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == 'exp' and node.func.attr == 'alias_' and node.args):
+                return node
+            table = node.args[0]
+            if not (isinstance(table, ast.Call) and isinstance(table.func, ast.Attribute)
+                    and isinstance(table.func.value, ast.Name) and table.func.value.id == 'exp'
+                    and table.func.attr == 'table_' and all(self.scalar(a) for a in table.args)
+                    and all(k.arg is not None and self.scalar(k.value) for k in table.keywords)):
+                return node
+            for keyword in node.keywords:
+                if keyword.arg == 'copy' and isinstance(keyword.value, ast.Constant) and type(keyword.value.value) is bool:
+                    keyword.value = ast.Constant(True)
+            return node
+    return ast.dump(Normalize().visit(copy.deepcopy(tree)))
+
+
 def select_python(filename, info, allow_equivalence=True):
     if filename not in SOURCES or info["deleted"]:
         return set(FILE_MAP.get(filename, ())) or set(ALL_TESTS)
@@ -168,6 +291,47 @@ def select_python(filename, info, allow_equivalence=True):
     new_dump = ast.dump(new_tree)
     if old_dump == new_dump:
         return set()
+    if allow_equivalence and old_dump.replace('Constant(value=False)', 'Constant(value=True)') == new_dump.replace('Constant(value=False)', 'Constant(value=True)'):
+        if fresh_copy_tree(old_tree) == fresh_copy_tree(new_tree):
+            return set()
+    comparison_shape = lambda dump: re.sub(r'\b(?:Lt|LtE|Gt|GtE|Eq|NotEq)\(\)', 'ComparisonOp()', dump)
+    if allow_equivalence and comparison_shape(old_dump) == comparison_shape(new_dump):
+        compared = comparison_tests(old_tree, new_tree, filename)
+        if compared is not None:
+            return compared
+    dictionary_edit = filename in MAPPING_READS and any(
+        isinstance(n, (ast.Assign, ast.AnnAssign)) and isinstance(n.value, ast.Dict)
+        and str(n.lineno) in MAPPING_READS[filename]
+        and any(n.lineno <= line <= n.end_lineno for line in changed | inserted)
+        for n in ast.walk(old_tree)
+    )
+    if dictionary_edit:
+        restored = copy.deepcopy(new_tree)
+        old_assignments = [n for n in ast.walk(old_tree) if isinstance(n, (ast.Assign, ast.AnnAssign))]
+        new_assignments = [n for n in ast.walk(restored) if isinstance(n, (ast.Assign, ast.AnnAssign))]
+        dictionary_tests = set()
+        handled = False
+        if len(old_assignments) == len(new_assignments):
+            for before, after in zip(old_assignments, new_assignments):
+                if not isinstance(before.value, ast.Dict) or not isinstance(after.value, ast.Dict):
+                    continue
+                keys = before.value.keys
+                if not all(isinstance(k, ast.Constant) for k in keys):
+                    continue
+                if [ast.dump(k) for k in keys] != [ast.dump(k) for k in after.value.keys]:
+                    continue
+                dependencies = MAPPING_READS[filename].get(str(before.lineno))
+                if dependencies is None:
+                    continue
+                changed_keys = [repr(k.value) for k, a, b in zip(keys, before.value.values, after.value.values)
+                                if ast.dump(a) != ast.dump(b)]
+                if changed_keys:
+                    handled = True
+                    for key in changed_keys:
+                        dictionary_tests.update(dependencies.get(key, ()))
+                    after.value = copy.deepcopy(before.value)
+            if handled and ast.dump(restored) == old_dump:
+                return dictionary_tests
     if allow_equivalence and filename in IDENTITY_SITES:
         # Most edits change more than identity operators. Avoid walking and copying
         # those large ASTs again when identity normalization cannot equate them.
@@ -256,11 +420,42 @@ def main(data_dir=DATA_DIR):
     runtime_numbers = {test["id"]: test["number"] for test in metadata}
     number_map = {int(n): runtime_numbers[tid] for n, tid in MAP_DATA["test_ids"].items()
                   if tid in runtime_numbers}
+    selections = []
+    requests = []
     for patch in sorted((data_dir / "commits").glob("*.patch")):
-        selected = select_tests_for_patch(patch.read_text("utf-8"))
+        text = patch.read_text("utf-8")
+        selected = select_tests_for_patch(text)
         selected = [number_map[n] for n in selected if n in number_map]
+        selections.append((patch.stem, selected))
+        files = parse_patch(text)
+        if selected and len(selected) <= 16 and sum(durations[n] for n in selected) <= 1 and all(
+            metadata[n]["file"].startswith("tests/dialects/") for n in selected
+        ) and all(
+            f.startswith("sqlglot/") and f.endswith(".py") and f in SOURCES and not i["deleted"]
+            for f, i in files.items()
+        ):
+            try:
+                changed = {f: apply_hunks(SOURCES[f], i["hunks"])[0] for f, i in files.items()}
+                requests.append({"commit": patch.stem, "sources": changed,
+                                 "tests": [metadata[n]["id"] for n in sorted(selected, key=durations.__getitem__)]})
+            except ValueError:
+                pass
+    passed = set()
+    if os.name == "posix" and (APP_DIR / "baseline.zip").exists() and requests:
+        try:
+            probe = subprocess.run([sys.executable, str(APP_DIR / "runtime_probe.py")],
+                                   input=json.dumps(requests), capture_output=True, text=True, timeout=50)
+            if probe.returncode == 0:
+                passed = set(json.loads(probe.stdout))
+            if os.getenv("PROBE_DEBUG"):
+                sys.stderr.write(probe.stderr)
+        except (subprocess.TimeoutExpired, ValueError):
+            pass
+    for commit, selected in selections:
+        if commit in passed:
+            selected = []
         workers = partition_tests(selected, durations)
-        print(json.dumps({"commit": patch.stem, "workers": workers}, separators=(",", ":")))
+        print(json.dumps({"commit": commit, "workers": workers}, separators=(",", ":")))
 
 
 if __name__ == "__main__":

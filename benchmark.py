@@ -22,7 +22,8 @@ def main():
         "import resource,runpy,sys;"
         "runpy.run_path('/app/selector.py',run_name='__main__');"
         "r=resource.getrusage(resource.RUSAGE_SELF);"
-        "print(r.ru_utime+r.ru_stime,file=sys.stderr)"
+        "c=resource.getrusage(resource.RUSAGE_CHILDREN);"
+        "print(r.ru_utime+r.ru_stime+c.ru_utime+c.ru_stime,file=sys.stderr)"
     )
     totals = []
     for attempt in range(3):

@@ -120,6 +120,53 @@ class SelectionChecks(unittest.TestCase):
                 diff(filename, before, before.replace("-1", "-2"))
             ), [4, 7])
 
+    def test_dictionary_value_changes_use_only_read_keys(self):
+        filename = 'sqlglot/synthetic_dictionary.py'
+        before = "class C:\n    options = {'a': 1, 'b': 2}\n"
+        with patch.dict(selector.SOURCES, {filename: before}), patch.dict(
+            selector.MAPPING_READS, {filename: {'2': {"'a'": [7], "'b'": [8]}}}
+        ):
+            self.assertEqual(selector.select_tests_for_patch(diff(filename, before, before.replace("'a': 1", "'a': 3"))), [7])
+
+    def test_copy_of_fresh_table_from_scalar_has_same_value(self):
+        filename = 'sqlglot/synthetic_fresh_copy.py'
+        before = "from sqlglot import exp\ndef f():\n    return exp.alias_(exp.table_('x'), alias='y', copy=False)\n"
+        with patch.dict(selector.SOURCES, {filename: before}):
+            self.assertEqual(selector.select_tests_for_patch(diff(filename, before, before.replace('copy=False', 'copy=True'))), [])
+
+    def test_copy_of_caller_owned_table_is_not_normalized(self):
+        filename = 'sqlglot/synthetic_owned_copy.py'
+        before = "from sqlglot import exp\ndef f(table):\n    return exp.alias_(table, alias='y', copy=False)\n"
+        with patch.dict(selector.SOURCES, {filename: before}), patch.dict(selector.LINE_MAP, {filename: {'3': [7]}}):
+            self.assertEqual(selector.select_tests_for_patch(diff(filename, before, before.replace('copy=False', 'copy=True'))), [7])
+
+    def test_copy_normalization_requires_sqlglot_binding(self):
+        filename = 'sqlglot/synthetic_other_library.py'
+        before = "from other import exp\ndef f():\n    return exp.alias_(exp.table_('x'), alias='y', copy=False)\n"
+        with patch.dict(selector.SOURCES, {filename: before}), patch.dict(selector.LINE_MAP, {filename: {'3': [7]}}):
+            self.assertEqual(selector.select_tests_for_patch(diff(filename, before, before.replace('copy=False', 'copy=True'))), [7])
+
+    def test_comparison_values_keep_tests_at_changed_boundary(self):
+        filename = 'sqlglot/synthetic_boundary.py'
+        before = 'def f(version):\n    return version < (23, 12)\n'
+        node = ast.parse(before).body[0].body[0].value
+        key = json.dumps([['f'], ast.dump(node.left), ast.dump(node.comparators[0])], separators=(',', ':'))
+        with patch.dict(selector.SOURCES, {filename: before}), patch.dict(
+            selector.COMPARISON_VALUES, {filename: {key: {'7': [['(23, 11)', '(23, 12)']],
+                                                        '8': [['(23, 12)', '(23, 12)']], '9': None}}}
+        ):
+            self.assertEqual(selector.select_tests_for_patch(diff(filename, before, before.replace(' < ', ' <= '))), [8, 9])
+
+    def test_comparison_values_do_not_hide_unrelated_edits(self):
+        filename = 'sqlglot/synthetic_comparison_other.py'
+        before = 'def f(value):\n    return value < 2\n'
+        node = ast.parse(before).body[0].body[0].value
+        key = json.dumps([['f'], ast.dump(node.left), ast.dump(node.comparators[0])], separators=(',', ':'))
+        with patch.dict(selector.SOURCES, {filename: before}), patch.dict(
+            selector.COMPARISON_VALUES, {filename: {key: {}}}
+        ), patch.dict(selector.LINE_MAP, {filename: {'2': [7]}}):
+            self.assertEqual(selector.select_tests_for_patch(diff(filename, before, before.replace('< 2', '<= 3'))), [7])
+
     def test_partitions_are_valid_and_never_cost_more_than_one_worker(self):
         rng = random.Random(42)
         for size in range(1, 50):

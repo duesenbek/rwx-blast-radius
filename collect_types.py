@@ -12,6 +12,7 @@ import gzip
 import importlib.machinery
 import json
 import os
+import operator
 from pathlib import Path
 import sys
 
@@ -27,8 +28,33 @@ def main():
     output = Path("identity_types.json.gz").resolve()
     safe = {}
     seen = set()
+    active = [None]
+    metadata = json.loads(Path('sample/tests.json').read_text())['tests']
+    numbers = {t['id']: t['number'] for t in metadata}
+    observations = {}
+    import_sites = set()
+
+    def primitive(value):
+        if type(value) in (int, bool, type(None)):
+            return True
+        if type(value) in (str, float):
+            return len(repr(value)) <= 128 and repr(value) not in ('nan', 'inf', '-inf')
+        return type(value) is tuple and len(value) <= 8 and all(primitive(v) for v in value)
 
     def compare(left, right, op, filename, key):
+        site_values = observations.setdefault(filename, {}).setdefault(key, {})
+        if active[0] is None:
+            import_sites.add((filename, key))
+        else:
+            number = str(active[0])
+            values = site_values.setdefault(number, set())
+            if values is not None:
+                if not primitive(left) or not primitive(right):
+                    site_values[number] = None
+                else:
+                    values.add((repr(left), repr(right)))
+                    if len(values) > 32:
+                        site_values[number] = None
         a, b = type(left), type(right)
         signature = (filename, key, a, b)
         if signature not in seen:
@@ -50,7 +76,9 @@ def main():
             return left is not right
         if op == "Eq":
             return left == right
-        return left != right
+        if op == "NotEq":
+            return left != right
+        return {'Lt': operator.lt, 'LtE': operator.le, 'Gt': operator.gt, 'GtE': operator.ge}[op](left, right)
 
     builtins._blast_radius_compare = compare
 
@@ -72,7 +100,8 @@ def main():
         def visit_Compare(self, node):
             key = comparison_key(self.scope, node) if len(node.ops) == 1 else None
             self.generic_visit(node)
-            if key is not None and isinstance(node.ops[0], (ast.Is, ast.IsNot, ast.Eq, ast.NotEq)):
+            if key is not None and isinstance(node.ops[0], (ast.Is, ast.IsNot, ast.Eq, ast.NotEq,
+                                                           ast.Lt, ast.LtE, ast.Gt, ast.GtE)):
                 return ast.copy_location(ast.Call(
                     func=ast.Name(id="_blast_radius_compare", ctx=ast.Load()),
                     args=[node.left, node.comparators[0], ast.Constant(type(node.ops[0]).__name__),
@@ -98,13 +127,26 @@ def main():
     os.environ["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
     os.chdir(repo)
     import pytest
-    exit_code = pytest.main(["-q", "--tb=short", "tests"])
+    class Context:
+        @pytest.hookimpl(tryfirst=True)
+        def pytest_runtest_setup(self, item):
+            active[0] = numbers.get(item.nodeid)
+
+        @pytest.hookimpl(trylast=True)
+        def pytest_runtest_teardown(self, item):
+            active[0] = None
+
+    exit_code = pytest.main(["-q", "--tb=short", "tests"], plugins=[Context()])
     result = {}
     for (filename, key), is_safe in sorted(safe.items()):
         if is_safe:
             result.setdefault(filename, []).append(key)
     with gzip.open(output, "wt", encoding="utf-8") as handle:
-        json.dump({"sites": result, "exit_code": int(exit_code)}, handle, separators=(",", ":"))
+        values = {f: {k: {n: sorted(v) if v is not None else None for n, v in ns.items()}
+                      for k, ns in sites.items() if (f, k) not in import_sites}
+                  for f, sites in observations.items()}
+        json.dump({"sites": result, "comparison_values": values, "exit_code": int(exit_code)},
+                  handle, separators=(",", ":"))
 
 
 if __name__ == "__main__":
