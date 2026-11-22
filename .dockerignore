@@ -1,0 +1,14 @@
+.git
+.coverage*
+sqlglot_repo/
+*.tar.gz
+__pycache__/
+*.pyc
+sample/
+map.json
+map.min.json
+output*.jsonl
+*.log
+.pytest_cache/
+*.py
+!selector.py
