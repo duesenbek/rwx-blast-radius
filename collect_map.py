@@ -103,6 +103,7 @@ def main():
     active = [None]
     cov = None
     number_to_id = {item["number"]: item["id"] for item in metadata}
+    shared_contexts = {}
     seen = set()
     attribute_map = collections.defaultdict(set)
     class_map = collections.defaultdict(set)
@@ -177,7 +178,7 @@ def main():
             if is_source:
                 active[0] = saved
                 if cov is not None and saved is not None:
-                    cov.switch_context(number_to_id[saved])
+                    cov.switch_context(number_to_id.get(saved, saved))
 
     importlib.machinery.SourceFileLoader.exec_module = exec_module
     original_open = builtins.open
@@ -214,6 +215,29 @@ def main():
     )
 
     class Contexts:
+        @pytest.hookimpl(hookwrapper=True, tryfirst=True)
+        def pytest_fixture_setup(self, fixturedef, request):
+            if fixturedef.scope == "function":
+                yield
+                return
+            prefix = request.node.nodeid
+            context = f"shared:{fixturedef.scope}:{prefix}"
+            if context not in shared_contexts:
+                shared_contexts[context] = {
+                    n for test_id, n in test_numbers.items()
+                    if not prefix or test_id.startswith((prefix + "::", prefix + "/"))
+                }
+            saved = active[0]
+            active[0] = context
+            seen.clear()
+            cov.switch_context(context)
+            try:
+                yield
+            finally:
+                active[0] = saved
+                seen.clear()
+                cov.switch_context(number_to_id.get(saved, saved) if saved is not None else "")
+
         @pytest.hookimpl(tryfirst=True)
         def pytest_runtest_setup(self, item):
             active[0] = test_numbers.get(item.nodeid)
@@ -232,6 +256,18 @@ def main():
     builtins.open = original_open
     io.open = original_io_open
     data = cov.get_data()
+
+    def expand(contexts):
+        numbers = set()
+        for context in contexts:
+            if isinstance(context, int):
+                numbers.add(context)
+            elif context in test_numbers:
+                numbers.add(test_numbers[context])
+            else:
+                numbers.update(shared_contexts.get(context, ()))
+        return sorted(numbers)
+
     line_map = collections.defaultdict(dict)
     for filename in sorted(data.measured_files()):
         path = Path(filename)
@@ -241,7 +277,7 @@ def main():
         for line, contexts in data.contexts_by_lineno(filename).items():
             if line not in function_lines[relative]:
                 continue
-            numbers = sorted({test_numbers[c] for c in contexts if c in test_numbers})
+            numbers = expand(contexts)
             if numbers:
                 line_map[relative][str(line)] = numbers
 
@@ -251,7 +287,7 @@ def main():
         # Direct runtime reads are precise; class use covers cached metaclass settings.
         numbers = attribute_map.get(definition) or class_map.get((module, qualname), set())
         for line in range(start, end + 1):
-            config_map[filename][str(line)] = sorted(numbers)
+            config_map[filename][str(line)] = expand(numbers)
 
     file_map = {}
     for filename in sources:
@@ -268,7 +304,7 @@ def main():
         "line_map": dict(line_map),
         "config_map": dict(config_map),
         "file_map": file_map,
-        "fixture_map": {f: sorted(ns) for f, ns in fixture_map.items()},
+        "fixture_map": {f: expand(ns) for f, ns in fixture_map.items()},
         "test_ids": {str(t["number"]): t["id"] for t in metadata},
         "sources": sources,
         "collection_exit_code": int(exit_code),

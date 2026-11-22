@@ -30,3 +30,4 @@ identity_types.json.gz
 optimizer.local-backup.py
 mapping_reads.json.gz
 probe_requests.json
+dependencies.safe.json.gz

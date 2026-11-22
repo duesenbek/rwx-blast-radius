@@ -1,7 +1,6 @@
 """Regression checks for diff parsing, dependency selection and worker costs."""
 
 import difflib
-import ast
 import itertools
 import json
 from pathlib import Path
@@ -73,35 +72,6 @@ class SelectionChecks(unittest.TestCase):
                 diff(filename, before, before.replace("utf-8", "ascii"))
             )), selector.ALL_TESTS)
 
-    def test_identity_normalization_requires_observed_site(self):
-        filename = "sqlglot/synthetic_identity.py"
-        before = "def f(value):\n    return value is None\n"
-        tree = ast.parse(before)
-        comparison = tree.body[0].body[0].value
-        key = json.dumps([["f"], ast.dump(comparison.left), ast.dump(comparison.comparators[0])],
-                         separators=(",", ":"))
-        text = diff(filename, before, before.replace(" is ", " == "))
-        with patch.dict(selector.SOURCES, {filename: before}), patch.dict(
-            selector.LINE_MAP, {filename: {"2": [7]}}
-        ):
-            self.assertEqual(selector.select_tests_for_patch(text), [7])
-            with patch.dict(selector.IDENTITY_SITES, {filename: {key}}):
-                self.assertEqual(selector.select_tests_for_patch(text), [])
-
-    def test_identity_normalization_does_not_hide_other_changes(self):
-        filename = "sqlglot/synthetic_other.py"
-        before = "def f(value):\n    return value is None\n"
-        tree = ast.parse(before)
-        comparison = tree.body[0].body[0].value
-        key = json.dumps([["f"], ast.dump(comparison.left), ast.dump(comparison.comparators[0])],
-                         separators=(",", ":"))
-        with patch.dict(selector.SOURCES, {filename: before}), patch.dict(
-            selector.LINE_MAP, {filename: {"2": [7]}}
-        ), patch.dict(selector.IDENTITY_SITES, {filename: {key}}):
-            self.assertEqual(selector.select_tests_for_patch(
-                diff(filename, before, before.replace(" is ", " != "))
-            ), [7])
-
     def test_syntax_error_selects_tests_even_when_map_is_empty(self):
         filename = "sqlglot/synthetic_syntax.py"
         before = "def f():\n    return 1\n"
@@ -110,62 +80,52 @@ class SelectionChecks(unittest.TestCase):
                 diff(filename, before, "def f(:\n    return 1\n")
             )), selector.ALL_TESTS)
 
-    def test_class_attribute_reads_use_config_dependencies(self):
+    def test_config_assignment_uses_all_observed_file_dependencies(self):
         filename = "sqlglot/synthetic_class.py"
         before = "class Dialect:\n    WEEK_OFFSET = -1\n"
         with patch.dict(selector.SOURCES, {filename: before}), patch.dict(
-            selector.CONFIG_MAP, {filename: {"2": [4, 7]}}
-        ):
+            selector.CONFIG_MAP, {filename: {"2": [4]}}
+        ), patch.dict(selector.FILE_MAP, {filename: [4, 7]}):
             self.assertEqual(selector.select_tests_for_patch(
                 diff(filename, before, before.replace("-1", "-2"))
             ), [4, 7])
 
-    def test_dictionary_value_changes_use_only_read_keys(self):
-        filename = 'sqlglot/synthetic_dictionary.py'
-        before = "class C:\n    options = {'a': 1, 'b': 2}\n"
+    def test_import_surface_change_includes_collection_importers(self):
+        filename = "sqlglot/shared_import.py"
+        before = "from math import sin\n"
         with patch.dict(selector.SOURCES, {filename: before}), patch.dict(
-            selector.MAPPING_READS, {filename: {'2': {"'a'": [7], "'b'": [8]}}}
+            selector.FILE_MAP, {filename: [7]}
+        ), patch.dict(selector.IMPORT_MAP, {filename: [8]}):
+            self.assertEqual(selector.select_tests_for_patch(
+                diff(filename, before, before.replace("sin", "cos"))
+            ), [7, 8])
+
+    def test_unread_statement_keeps_function_callers(self):
+        filename = "sqlglot/branch_example.py"
+        before = "def f(x):\n    if x:\n        return 1\n    return 2\n"
+        with patch.dict(selector.SOURCES, {filename: before}), patch.dict(
+            selector.LINE_MAP, {filename: {"2": [7], "4": [7]}}
         ):
-            self.assertEqual(selector.select_tests_for_patch(diff(filename, before, before.replace("'a': 1", "'a': 3"))), [7])
+            self.assertEqual(selector.select_tests_for_patch(diff(filename, before, before.replace("return 1", "return 3"))), [7])
 
-    def test_copy_of_fresh_table_from_scalar_has_same_value(self):
-        filename = 'sqlglot/synthetic_fresh_copy.py'
-        before = "from sqlglot import exp\ndef f():\n    return exp.alias_(exp.table_('x'), alias='y', copy=False)\n"
-        with patch.dict(selector.SOURCES, {filename: before}):
-            self.assertEqual(selector.select_tests_for_patch(diff(filename, before, before.replace('copy=False', 'copy=True'))), [])
+    def test_unknown_fixture_gets_full_suite(self):
+        filename = "tests/fixtures/unmapped.json"
+        self.assertEqual(set(selector.select_tests_for_patch(diff(filename, "{}\n", "[]\n"))), selector.ALL_TESTS)
 
-    def test_copy_of_caller_owned_table_is_not_normalized(self):
-        filename = 'sqlglot/synthetic_owned_copy.py'
-        before = "from sqlglot import exp\ndef f(table):\n    return exp.alias_(table, alias='y', copy=False)\n"
-        with patch.dict(selector.SOURCES, {filename: before}), patch.dict(selector.LINE_MAP, {filename: {'3': [7]}}):
-            self.assertEqual(selector.select_tests_for_patch(diff(filename, before, before.replace('copy=False', 'copy=True'))), [7])
+    def test_metadata_only_rename_in_multi_file_diff_gets_full_suite(self):
+        text = ("diff --git a/sqlglot/old.py b/sqlglot/new.py\n"
+                "similarity index 100%\nrename from sqlglot/old.py\nrename to sqlglot/new.py\n"
+                "diff --git a/README.md b/README.md\n")
+        text += diff("README.md", "old\n", "new\n")
+        self.assertEqual(set(selector.select_tests_for_patch(text)), selector.ALL_TESTS)
 
-    def test_copy_normalization_requires_sqlglot_binding(self):
-        filename = 'sqlglot/synthetic_other_library.py'
-        before = "from other import exp\ndef f():\n    return exp.alias_(exp.table_('x'), alias='y', copy=False)\n"
-        with patch.dict(selector.SOURCES, {filename: before}), patch.dict(selector.LINE_MAP, {filename: {'3': [7]}}):
-            self.assertEqual(selector.select_tests_for_patch(diff(filename, before, before.replace('copy=False', 'copy=True'))), [7])
-
-    def test_comparison_values_keep_tests_at_changed_boundary(self):
-        filename = 'sqlglot/synthetic_boundary.py'
-        before = 'def f(version):\n    return version < (23, 12)\n'
-        node = ast.parse(before).body[0].body[0].value
-        key = json.dumps([['f'], ast.dump(node.left), ast.dump(node.comparators[0])], separators=(',', ':'))
-        with patch.dict(selector.SOURCES, {filename: before}), patch.dict(
-            selector.COMPARISON_VALUES, {filename: {key: {'7': [['(23, 11)', '(23, 12)']],
-                                                        '8': [['(23, 12)', '(23, 12)']], '9': None}}}
-        ):
-            self.assertEqual(selector.select_tests_for_patch(diff(filename, before, before.replace(' < ', ' <= '))), [8, 9])
-
-    def test_comparison_values_do_not_hide_unrelated_edits(self):
-        filename = 'sqlglot/synthetic_comparison_other.py'
-        before = 'def f(value):\n    return value < 2\n'
-        node = ast.parse(before).body[0].body[0].value
-        key = json.dumps([['f'], ast.dump(node.left), ast.dump(node.comparators[0])], separators=(',', ':'))
-        with patch.dict(selector.SOURCES, {filename: before}), patch.dict(
-            selector.COMPARISON_VALUES, {filename: {key: {}}}
-        ), patch.dict(selector.LINE_MAP, {filename: {'2': [7]}}):
-            self.assertEqual(selector.select_tests_for_patch(diff(filename, before, before.replace('< 2', '<= 3'))), [7])
+    def test_shared_setup_fixture_includes_entire_executor_class(self):
+        filename = "tests/fixtures/optimizer/tpc-h/tpc-h.sql"
+        patch_text = diff(filename, "SELECT 1;\n", "# malformed metadata\nSELECT 1;\n")
+        executor = {int(n) for n, test_id in selector.MAP_DATA["test_ids"].items()
+                    if test_id.startswith("tests/test_executor.py::TestExecutor::")}
+        self.assertGreater(len(executor), 1)
+        self.assertLessEqual(executor, set(selector.select_tests_for_patch(patch_text)))
 
     def test_partitions_are_valid_and_never_cost_more_than_one_worker(self):
         rng = random.Random(42)

@@ -2,35 +2,19 @@
 
 ## Current selector
 
-The optimized Linux entry scores **94.904 simulated seconds with zero misses** on
-the 30 supplied samples, down from 115.223 seconds for the previous selector. Three
-local Linux/amd64 container runs under the contest limits gave a median score of
-**96.9 seconds including all child-process CPU**. This is a sample result, not a hidden-board score.
-Even selecting only the known failing sample tests costs 94.351 simulated seconds.
+The current entry prioritizes catching failures after the previous submission
+missed one commit on the hidden batch. On the 30 public samples it scores
+**186.983 simulated seconds, zero misses**, with a median of **187.9 seconds
+including CPU** over three Linux container runs. The hidden batch is separate.
 
-The image uses `selector.py`, `dependencies.json.gz`, `runtime_probe.py`,
-`prepare_runtime.py` and `baseline.zip`; all must be committed before submitting.
-The map contains baseline source, line coverage, dictionary-value reads,
-class-setting dependencies, fixture reads, operand types and bounded observations
-of primitive comparison operands, collected from the unmodified pinned source.
-It contains no patch IDs, sample answers or precomputed failure sets. Runtime
-selection never reads `answers.json` and requires no runtime network. Short dialect
-suites are verified against the actual patch in independent forked processes, in
-a temporary checkout under `/tmp`. Only a fully successful selected suite removes
-its CI workers. Errors, missing dependencies and timeouts keep the static selection.
-Tests retain their original implementations. The image installs pinned `pytz` from
-PyPI and builds hash-validated bytecode before the charged run starts. SQLGlot's
-source license is included in `SQLGLOT_LICENSE` and in the baseline archive.
-Identity/equality normalization is limited to single-file changes with otherwise
-identical syntax and operand types observed on the baseline whose equality is
-identity-based. Comparison edits are evaluated against the stored primitive
-operands at runtime; unknown values use the conservative selection. Dictionary
-edits require unchanged keys and otherwise identical syntax. Copying a temporary
-`table_` built from scalar inputs before `alias_` is treated as value-equivalent.
-Other edits use dependency selection; hidden mutations may still
-expose dependencies absent from baseline execution.
-
-Local verification:
+The selector uses baseline line coverage, fixture reads, and imports observed
+when collecting each test file. Fixtures loaded in shared setup are assigned to
+all tests in that scope. A regression check that breaks TPC-H fixture metadata
+observed 61 pytest failures, all covered by the new selection. The Docker entry
+keeps its selected tests in the CI output and uses wider coverage for settings,
+import changes and diffs it cannot safely interpret. It does not read sample
+answers during selection or run patched code. Baseline source is MIT licensed
+as described in `SQLGLOT_LICENSE`.
 
 ```sh
 python verify_selector.py
@@ -39,22 +23,12 @@ docker build --platform linux/amd64 -t blast-radius-entry .
 python benchmark.py
 ```
 
-`evaluate.py` on Windows verifies the static selection (101.143 simulated seconds).
-`benchmark.py` measures the complete Linux entry, including subprocess CPU, using
-the contest's read-only filesystem, nobody user, 64 MB tmpfs, process and CPU limits.
-
-To regenerate maps, obtain a clean checkout of
-`eb11aec4be8cb2122afe713a4816662c3f0fb2fa` as `sqlglot_repo`, install
+To regenerate the map, put a clean checkout of
+`eb11aec4be8cb2122afe713a4816662c3f0fb2fa` in `sqlglot_repo`, install
 `requirements.lock` and `coverage==7.17.4` in the pinned Linux/Python environment,
-then run `python prepare_maps.py`. Collection executes the unmodified tests with
-inline pools, preserving argument/result pickle round trips for process pools.
-It requires `sample/tests.json` for test IDs, and does not read patches or labels.
-Do not substitute thread pools in the source: optimizer process serialization is
-a real dependency. The earlier local optimizer version is preserved in the
-ignored `optimizer.local-backup.py` file.
-
-An optimized submission for the Blast Radius track. The original challenge and
-submission instructions follow.
+and run `python prepare_maps.py`. The collector uses `sample/tests.json` for
+stable test IDs. It preserves process-pool argument and result serialization
+when attributing child work to its requesting test.
 
 ## The problem
 
