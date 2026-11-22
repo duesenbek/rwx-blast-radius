@@ -23,3 +23,8 @@ score.py
 SCORING.md
 map_optimizer_fixtures.py
 parse_sample_patches.py
+selector_baseline.py
+dependencies.linux.json.gz
+dependencies.optimizer.json.gz
+identity_types.json.gz
+optimizer.local-backup.py

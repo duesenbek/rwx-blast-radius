@@ -1,6 +1,44 @@
-# Blast Radius starter
+# Blast Radius entry
 
-A working submission for the Blast Radius track. It runs every test on every commit, so it never misses a failure and scores badly. Your job is to run less without missing.
+## Current selector
+
+The optimized entry scores **115.223 simulated seconds with zero misses** on the
+30 supplied samples, down from 152.664 seconds for the previous selector. Three
+local Linux/amd64 container runs under the contest limits gave a median score of
+**116.6 seconds including CPU**. This is a sample result, not a hidden-board score.
+Even selecting only the known failing sample tests costs 94.351 simulated seconds.
+
+The image uses `selector.py` and `dependencies.json.gz`, both of which must be
+committed before submitting. The map contains baseline source, line coverage,
+observed class-setting dependencies, fixture reads and operand-type information.
+It contains no patch IDs, sample answers or precomputed failure sets. Runtime
+selection never reads `answers.json` and requires no network or writable files.
+Identity/equality normalization is limited to single-file changes with otherwise
+identical syntax and operand types observed on the baseline whose equality is
+identity-based. Other edits use dependency selection; hidden mutations may still
+expose dependencies absent from baseline execution.
+
+Local verification:
+
+```sh
+python verify_selector.py
+python evaluate.py
+docker build --platform linux/amd64 -t blast-radius-entry .
+python benchmark.py
+```
+
+To regenerate maps, obtain a clean checkout of
+`eb11aec4be8cb2122afe713a4816662c3f0fb2fa` as `sqlglot_repo`, install
+`requirements.lock` and `coverage==7.17.4` in the pinned Linux/Python environment,
+then run `python prepare_maps.py`. Collection executes the unmodified tests with
+inline pools, preserving argument/result pickle round trips for process pools.
+It requires `sample/tests.json` for test IDs, and does not read patches or labels.
+Do not substitute thread pools in the source: optimizer process serialization is
+a real dependency. The earlier local optimizer version is preserved in the
+ignored `optimizer.local-backup.py` file.
+
+An optimized submission for the Blast Radius track. The original challenge and
+submission instructions follow.
 
 ## The problem
 
